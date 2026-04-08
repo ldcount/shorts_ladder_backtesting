@@ -77,6 +77,18 @@ class BybitOrderSubmission:
 
 
 @dataclass(slots=True)
+class BybitExecution:
+    symbol: str
+    order_id: str
+    order_link_id: str
+    side: str
+    exec_price: float
+    exec_qty: float
+    exec_time: datetime
+    is_maker: bool
+
+
+@dataclass(slots=True)
 class BybitCandle:
     symbol: str
     timeframe: str
@@ -104,6 +116,7 @@ class BybitClient:
         "get_instruments_info": 0.05,
         "get_tickers": 0.05,
         "get_kline": 0.20,
+        "get_executions": 0.10,
         "get_positions": 0.10,
         "get_open_orders": 0.10,
         "place_order": 0.15,
@@ -325,6 +338,28 @@ class BybitClient:
         )
         rows = response.get("list", [])
         return [self._parse_position_snapshot(item) for item in rows]
+
+    def get_executions(
+        self,
+        *,
+        symbol: str,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> tuple[list[BybitExecution], str | None]:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol.upper(),
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        response = self._call("get_executions", **params)
+        rows = response.get("list", [])
+        next_cursor = response.get("nextPageCursor") or None
+        executions = [self._parse_execution(item) for item in rows]
+        executions.sort(key=lambda execution: execution.exec_time, reverse=True)
+        return executions, next_cursor
 
     def place_market_order(
         self,
@@ -553,6 +588,25 @@ class BybitClient:
             updated_time=cls._parse_timestamp_ms(item.get("updatedTime")),
             take_profit=cls._parse_float(item.get("takeProfit")),
             stop_loss=cls._parse_float(item.get("stopLoss")),
+        )
+
+    @classmethod
+    def _parse_execution(cls, item: dict[str, Any]) -> BybitExecution:
+        symbol = str(item.get("symbol", "")).upper()
+        exec_time = cls._parse_timestamp_ms(item.get("execTime"))
+        if exec_time is None:
+            raise BybitClientError(
+                f"Bybit returned an invalid `execTime` value for {symbol}: {item.get('execTime')!r}."
+            )
+        return BybitExecution(
+            symbol=symbol,
+            order_id=str(item.get("orderId", "")),
+            order_link_id=str(item.get("orderLinkId", "")),
+            side=str(item.get("side", "")),
+            exec_price=cls._require_float(item.get("execPrice"), field_name="execPrice", symbol=symbol),
+            exec_qty=cls._require_float(item.get("execQty"), field_name="execQty", symbol=symbol),
+            exec_time=exec_time,
+            is_maker=bool(item.get("isMaker", False)),
         )
 
     @staticmethod

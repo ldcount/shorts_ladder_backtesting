@@ -16,6 +16,7 @@ from core.models import DailySetupState, PositionState
 from data.bybit_client import (
     BybitClient,
     BybitClientError,
+    BybitExecution,
     BybitInstrumentSpec,
     BybitOpenOrder,
     BybitPositionSnapshot,
@@ -422,6 +423,7 @@ class ProductionRunner:
                 state["last_position_size"] = 0.0
                 state["tp1_consumed"] = False
                 state["position_opened_at"] = None
+                state["position_opened_at_source"] = None
                 state["last_time_stop_sent_at"] = None
                 continue
 
@@ -543,9 +545,24 @@ class ProductionRunner:
             state["tp1_consumed"] = True
 
         state["last_position_size"] = current_size
-        if state.get("position_opened_at") is None:
-            opened_at = live_position.created_time or as_of_time
-            state["position_opened_at"] = opened_at.isoformat()
+        if (
+            state.get("position_opened_at") is None
+            or state.get("position_opened_at_source") != "bot_execution_history"
+        ):
+            opened_at = self._derive_position_opened_at(
+                symbol=symbol,
+                current_position_size=current_size,
+            )
+            if opened_at is not None:
+                state["position_opened_at"] = opened_at.isoformat()
+                state["position_opened_at_source"] = "bot_execution_history"
+            else:
+                self._logger.warning(
+                    "Could not derive bot-managed open time for %s at size=%s. "
+                    "Time-stop management will stay disabled until a managed fill can be reconstructed.",
+                    symbol,
+                    current_size,
+                )
 
         anchor_price = state.get("anchor_price")
         check_timestamp = _parse_optional_iso_datetime(state.get("check_timestamp"))
@@ -819,6 +836,44 @@ class ProductionRunner:
         open_short_positions.sort(key=lambda snapshot: snapshot.size, reverse=True)
         return open_short_positions[0]
 
+    def _derive_position_opened_at(
+        self,
+        *,
+        symbol: str,
+        current_position_size: float,
+    ) -> datetime | None:
+        if current_position_size <= 0:
+            return None
+
+        managed_executions: list[BybitExecution] = []
+        cursor: str | None = None
+
+        for _ in range(20):
+            page, cursor = self._bybit_client.get_executions(
+                symbol=symbol,
+                limit=100,
+                cursor=cursor,
+            )
+            managed_executions.extend(
+                execution
+                for execution in page
+                if _is_managed_entry_order(execution.order_link_id)
+                or _is_managed_exit_order(execution.order_link_id)
+            )
+            derived_opened_at = _derive_managed_short_opened_at(
+                executions=managed_executions,
+                current_position_size=current_position_size,
+            )
+            if derived_opened_at is not None:
+                return derived_opened_at
+            if not cursor:
+                break
+
+        return _derive_managed_short_opened_at(
+            executions=managed_executions,
+            current_position_size=current_position_size,
+        )
+
     def _cancel_order(
         self,
         order: BybitOpenOrder,
@@ -929,6 +984,43 @@ def _managed_exit_kind(order_link_id: str) -> str | None:
         return "tp1"
     if order_link_id.startswith(EXIT_TP2_ORDER_PREFIX):
         return "tp2"
+    return None
+
+
+def _is_managed_exit_order(order_link_id: str) -> bool:
+    return (
+        _managed_exit_kind(order_link_id) is not None
+        or order_link_id.startswith(TIME_STOP_ORDER_PREFIX)
+    )
+
+
+def _derive_managed_short_opened_at(
+    *,
+    executions: list[BybitExecution],
+    current_position_size: float,
+    tolerance: float = 1e-9,
+) -> datetime | None:
+    remaining_size = float(current_position_size)
+    if remaining_size <= tolerance:
+        return None
+
+    ordered_executions = sorted(
+        executions,
+        key=lambda execution: execution.exec_time,
+        reverse=True,
+    )
+
+    for execution in ordered_executions:
+        side = execution.side.lower()
+        if side == "buy" and _is_managed_exit_order(execution.order_link_id):
+            remaining_size += execution.exec_qty
+            continue
+
+        if side == "sell" and _is_managed_entry_order(execution.order_link_id):
+            remaining_size -= execution.exec_qty
+            if remaining_size <= tolerance:
+                return execution.exec_time
+
     return None
 
 
