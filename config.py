@@ -83,7 +83,7 @@ class AppConfig:
     apply_funding: bool = False
 
     # Production runtime
-    production_startup_ladder_enabled: bool = True
+    production_startup_ladder_enabled: bool = False
     bybit_api_key: str | None = field(default=None, repr=False)
     bybit_api_secret: str | None = field(default=None, repr=False)
     bybit_testnet: bool = False
@@ -199,11 +199,4 @@ def get_config(*, env_path: Path | None = None) -> AppConfig:
             config.production_monitor_interval_seconds = int(production_monitor_interval_seconds)
         except ValueError:
             pass
-    config.production_startup_ladder_enabled = _parse_bool_env(
-        env_values.get(
-            "PRODUCTION_STARTUP_LADDER_ENABLED",
-            os.getenv("PRODUCTION_STARTUP_LADDER_ENABLED"),
-        ),
-        config.production_startup_ladder_enabled,
-    )
     return config
