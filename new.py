@@ -433,6 +433,17 @@ class ProductionRunner:
                 state=state,
                 as_of_time=as_of_time,
             )
+            if state.get("position_opened_at_source") != "bot_execution_history":
+                for order in symbol_exit_orders:
+                    self._cancel_order(order, actions=actions, reason="unmanaged_live_position")
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "skip_exit_management_unmanaged_position",
+                        "message": "Live position is not attributable to bot-managed fills.",
+                    }
+                )
+                continue
             if position_state is None:
                 actions.append(
                     {
@@ -494,6 +505,7 @@ class ProductionRunner:
             self._upsert_stop_loss(
                 symbol=symbol,
                 stop_price=thresholds.stop_price,
+                current_stop_price=live_position.stop_loss,
                 instrument_spec=instrument_spec,
                 actions=actions,
             )
@@ -539,6 +551,7 @@ class ProductionRunner:
     ) -> PositionState | None:
         previous_size = float(state.get("last_position_size", 0.0) or 0.0)
         current_size = float(live_position.size)
+        size_changed = not _floats_match(previous_size, current_size)
         if current_size > previous_size + 1e-12:
             state["tp1_consumed"] = False
         elif previous_size > current_size > 0 and current_size < previous_size - 1e-12:
@@ -549,20 +562,26 @@ class ProductionRunner:
             state.get("position_opened_at") is None
             or state.get("position_opened_at_source") != "bot_execution_history"
         ):
-            opened_at = self._derive_position_opened_at(
-                symbol=symbol,
-                current_position_size=current_size,
+            should_reconstruct_open_time = (
+                state.get("position_opened_at_source") != "unmanaged_live_position" or size_changed
             )
-            if opened_at is not None:
-                state["position_opened_at"] = opened_at.isoformat()
-                state["position_opened_at_source"] = "bot_execution_history"
-            else:
-                self._logger.warning(
-                    "Could not derive bot-managed open time for %s at size=%s. "
-                    "Time-stop management will stay disabled until a managed fill can be reconstructed.",
-                    symbol,
-                    current_size,
+            if should_reconstruct_open_time:
+                opened_at = self._derive_position_opened_at(
+                    symbol=symbol,
+                    current_position_size=current_size,
                 )
+                if opened_at is not None:
+                    state["position_opened_at"] = opened_at.isoformat()
+                    state["position_opened_at_source"] = "bot_execution_history"
+                else:
+                    state["position_opened_at"] = None
+                    state["position_opened_at_source"] = "unmanaged_live_position"
+                    self._logger.warning(
+                        "Could not derive bot-managed open time for %s at size=%s. "
+                        "Exit management will stay disabled unless managed fills can be reconstructed.",
+                        symbol,
+                        current_size,
+                    )
 
         anchor_price = state.get("anchor_price")
         check_timestamp = _parse_optional_iso_datetime(state.get("check_timestamp"))
@@ -585,16 +604,40 @@ class ProductionRunner:
         *,
         symbol: str,
         stop_price: float,
+        current_stop_price: float | None,
         instrument_spec: BybitInstrumentSpec,
         actions: list[dict[str, object]],
     ) -> None:
         normalized_stop = _round_to_step(stop_price, instrument_spec.tick_size, rounding=ROUND_HALF_UP)
-        self._bybit_client.set_trading_stop(
-            symbol=symbol,
-            position_idx=self._config.bybit_position_idx,
-            stop_loss=_format_decimal(normalized_stop),
-            take_profit="0",
-        )
+        if current_stop_price is not None and _floats_match(current_stop_price, normalized_stop):
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "action": "keep_stop_loss",
+                    "stop_price": normalized_stop,
+                }
+            )
+            return
+
+        try:
+            self._bybit_client.set_trading_stop(
+                symbol=symbol,
+                position_idx=self._config.bybit_position_idx,
+                stop_loss=_format_decimal(normalized_stop),
+                take_profit="0",
+            )
+        except BybitClientError as exc:
+            if _is_bybit_not_modified_error(exc):
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "action": "keep_stop_loss",
+                        "stop_price": normalized_stop,
+                    }
+                )
+                return
+            raise
+
         actions.append(
             {
                 "symbol": symbol,
@@ -1026,6 +1069,11 @@ def _derive_managed_short_opened_at(
 
 def _floats_match(left: float, right: float, tolerance: float = 1e-12) -> bool:
     return abs(left - right) <= tolerance
+
+
+def _is_bybit_not_modified_error(error: Exception) -> bool:
+    message = str(error)
+    return "ErrCode: 34040" in message or "retCode=34040" in message
 
 
 def _parse_optional_iso_datetime(value: Any) -> datetime | None:
